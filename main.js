@@ -10281,6 +10281,7 @@ const BILL_API = `${API}/order-bill`
 // (ContentScript.js : DEFAULT_WAIT_FOR_ELEMENT_ACCROSS_PAGES_TIMEOUT = 60 * s).
 const WAIT_LOGIN_FORM = 60 * 1000
 const WAIT_LOGOUT = 30 * 1000
+const WAIT_TOKEN = 60 * 1000
 
 // Relevé sur le site : l'écran e-mail a un <form>, mais PAS l'écran mot de
 // passe — son champ vit dans un simple <span>. Les sélecteurs de bouton ne
@@ -10395,6 +10396,34 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     return true
   }
 
+  // L'espace client n'écrit `currentUser` dans localStorage qu'une fois sa page
+  // chargée : juste après la redirection de connexion, le stockage est encore
+  // vide. On navigue donc explicitement sur la page des commandes — ce qui
+  // garantit aussi d'être sur l'origine www.darty.com, le stockage étant
+  // cloisonné par origine — puis on attend l'apparition du jeton.
+  async ensureAccessToken() {
+    if (this.store.accessToken) return this.store.accessToken
+    await this.goto(ORDERS_PAGE_URL)
+    try {
+      await this.runInWorkerUntilTrue({
+        method: 'waitForAccessToken',
+        timeout: WAIT_TOKEN
+      })
+    } catch (err) {
+      throw new Error(
+        `Aucun jeton d'API n'est apparu dans localStorage.currentUser dans les ` +
+          `${WAIT_TOKEN / 1000}s suivant le chargement de ${ORDERS_PAGE_URL}`
+      )
+    }
+    this.store.accessToken = await this.runInWorker('getAccessToken')
+    return this.store.accessToken
+  }
+
+  // Exécuté dans le worker, en boucle jusqu'à ce que le jeton soit écrit.
+  async waitForAccessToken() {
+    return Boolean(await this.getAccessToken())
+  }
+
   async persistCapturedCredentials() {
     const { login, password } = this.store.userCredentials || {}
     if (!login || !password) {
@@ -10412,7 +10441,13 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     } catch (err) {
       // Une authentification réussie ne doit pas être perdue parce que
       // l'écriture du trousseau a échoué.
-      this.log('warn', `Écriture du trousseau impossible : ${err.message}`)
+      // Au tout premier run, le compte n'existe pas encore quand
+      // ensureAuthenticated s'exécute : fetch() réessaiera.
+      this.log(
+        'info',
+        `Trousseau non écrit à ce stade (${err.message}), nouvelle tentative ` +
+          'dans fetch()'
+      )
     }
   }
 
@@ -10527,15 +10562,7 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   }
 
   async callApi(url) {
-    if (!this.store.accessToken) {
-      this.store.accessToken = await this.runInWorker('getAccessToken')
-      if (!this.store.accessToken) {
-        throw new Error(
-          "Aucun jeton d'API dans localStorage.currentUser : la session n'est " +
-            'probablement pas établie.'
-        )
-      }
-    }
+    await this.ensureAccessToken()
     const { data, error } = await this.runInWorker(
       'fetchApi',
       url,
@@ -10665,7 +10692,11 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
 const connector = new DartyContentScript()
 connector
   .init({
-    additionalExposedMethodsNames: ['getAccessToken', 'fetchApi']
+    additionalExposedMethodsNames: [
+      'getAccessToken',
+      'waitForAccessToken',
+      'fetchApi'
+    ]
   })
   .catch(err => {
     log.warn(err)
