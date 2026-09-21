@@ -10292,6 +10292,9 @@ const WAIT_LOGIN_FORM = 60 * 1000
 const WAIT_LOGOUT = 10 * 1000
 const WAIT_TOKEN = 60 * 1000
 const WAIT_PAGE = 60 * 1000
+// Une étape de formulaire déjà affichée réagit en quelques secondes : inutile
+// d'attendre une minute avant de basculer en saisie manuelle.
+const WAIT_STEP = 25 * 1000
 
 // Relevé sur le site : l'écran e-mail a un <form>, mais PAS l'écran mot de
 // passe — son champ vit dans un simple <span>. Les sélecteurs de bouton ne
@@ -10441,7 +10444,11 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   // cloisonné par origine — puis on attend l'apparition du jeton.
   async ensureAccessToken() {
     if (this.store.accessToken) return this.store.accessToken
-    await this.goto(ORDERS_PAGE_URL)
+    // ensureAuthenticated vient de nous y amener : renaviguer coûterait un
+    // chargement complet de page pour rien.
+    if (!(await this.runInWorker('checkAuthenticated'))) {
+      await this.goto(ORDERS_PAGE_URL)
+    }
     try {
       await this.runInWorkerUntilTrue({
         method: 'waitForAccessToken',
@@ -10492,17 +10499,59 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   async authWithCredentials({ login, password }) {
     this.log('info', '🤖 authWithCredentials')
     await this.navigateToLoginForm()
-    await this.runInWorker('fillText', SELECTORS.emailField, login)
-    await this.runInWorker('click', SELECTORS.emailSubmit)
-    await this.waitForElementInWorker(SELECTORS.passwordField, {
-      timeout: WAIT_LOGIN_FORM
+
+    await this.runInWorker('fillReactField', SELECTORS.emailField, login)
+    await this.runInWorkerUntilTrue({
+      method: 'waitForEnabledSubmit',
+      timeout: WAIT_STEP
     })
-    await this.runInWorker('fillText', SELECTORS.passwordField, password)
+    await this.runInWorker('click', SELECTORS.emailSubmit)
+
+    await this.waitForElementInWorker(SELECTORS.passwordField, {
+      timeout: WAIT_STEP
+    })
+    await this.runInWorker('fillReactField', SELECTORS.passwordField, password)
+    await this.runInWorkerUntilTrue({
+      method: 'waitForEnabledSubmit',
+      timeout: WAIT_STEP
+    })
     await this.runInWorker('click', SELECTORS.passwordSubmit)
+
     await this.runInWorkerUntilTrue({ method: 'waitForAuthenticated' })
     if (!(await this.runInWorker('checkAuthenticated'))) {
       throw new Error('LOGIN_FAILED')
     }
+  }
+
+  // Exécuté dans le worker. `fillText` de cozy-clisk fait `elem.value = text`,
+  // ce que React ne voit pas : il surcharge le setter `value` sur l'instance
+  // pour suivre ses champs contrôlés. On passe donc par le setter natif du
+  // prototype, seul moyen de déclencher la mise à jour d'état côté React.
+  async fillReactField(selector, text) {
+    const elem = document.querySelector(selector)
+    if (!elem) return false
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype,
+      'value'
+    ).set
+    elem.focus()
+    nativeSetter.call(elem, text)
+    elem.dispatchEvent(new Event('input', { bubbles: true }))
+    elem.dispatchEvent(new Event('change', { bubbles: true }))
+    elem.blur()
+    return true
+  }
+
+  // Exécuté dans le worker. Le bouton reste désactivé tant que React n'a pas
+  // validé la saisie : cliquer trop tôt ne produirait rien.
+  async waitForEnabledSubmit() {
+    const button = document.querySelector('button[type="submit"]')
+    if (!button) return false
+    return (
+      !button.disabled &&
+      button.getAttribute('aria-disabled') !== 'true' &&
+      button.getAttribute('aria-busy') !== 'true'
+    )
   }
 
   async showLoginFormAndWaitForAuthentication() {
@@ -10789,6 +10838,8 @@ connector
       'getAccessToken',
       'waitForAccessToken',
       'waitForLoginFormOrSession',
+      'fillReactField',
+      'waitForEnabledSubmit',
       'fetchApi'
     ]
   })
