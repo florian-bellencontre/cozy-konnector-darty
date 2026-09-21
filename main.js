@@ -10158,7 +10158,9 @@ function parseDate(value) {
   const french = String(value).match(/(\d{2})\/(\d{2})\/(\d{4})/)
   if (french) {
     const isoDateString = french.slice(1, 4).reverse().join('-')
-    return { isoDateString, date: new Date(isoDateString) }
+    const date = new Date(isoDateString)
+    // Le motif peut correspondre sans que la date soit valide (32/13/2026).
+    return Number.isNaN(date.getTime()) ? empty : { isoDateString, date }
   }
 
   const parsed = new Date(value)
@@ -10280,7 +10282,7 @@ const BILL_API = `${API}/order-bill`
 // Les timeouts de cozy-clisk sont en millisecondes
 // (ContentScript.js : DEFAULT_WAIT_FOR_ELEMENT_ACCROSS_PAGES_TIMEOUT = 60 * s).
 const WAIT_LOGIN_FORM = 60 * 1000
-const WAIT_LOGOUT = 30 * 1000
+const WAIT_LOGOUT = 10 * 1000
 const WAIT_TOKEN = 60 * 1000
 
 // Relevé sur le site : l'écran e-mail a un <form>, mais PAS l'écran mot de
@@ -10538,7 +10540,9 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
         // Jeton illisible : on passe au suivant.
       }
     }
-    return tokens[0]
+    // Ne pas retomber sur un jeton RS256 du SDK ForgeRock : l'API le refuse
+    // (401/503), et l'échec serait alors indiscernable d'une session expirée.
+    return null
   }
 
   // Exécuté dans le worker : la requête part de la page, donc avec ses cookies
@@ -10604,15 +10608,18 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     const orders = payload?.orders || []
     this.log('info', `${orders.length} commande(s) retournée(s) par l'API`)
 
-    const withBill = orders.filter(order => order.billAvailable)
-    const skipped = orders.length - withBill.length
-    if (skipped) {
-      this.log(
-        'info',
-        `${skipped} commande(s) sans facture disponible, ignorée(s)`
-      )
-    }
-    if (!withBill.length) return
+    if (!orders.length) return
+    // `billAvailable` ne reflète pas la disponibilité réelle : une commande
+    // marquée `false` peut tout de même avoir une facture téléchargeable — c'est
+    // le cas constaté en production. On tente donc toutes les commandes, et
+    // downloadFileInWorker écarte celles qui n'aboutissent pas.
+    const announced = orders.filter(order => order.billAvailable).length
+    this.log(
+      'info',
+      `${announced}/${orders.length} commande(s) annoncent billAvailable ; ` +
+        `toutes seront tentées`
+    )
+    const withBill = orders
 
     // Journalisé une seule fois, chiffres masqués, pour pouvoir diagnostiquer
     // un changement de format de date sans exposer de donnée.
@@ -10624,24 +10631,32 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     const entries = []
     for (const order of withBill) {
       const { date, isoDateString } = (0,_helpers__WEBPACK_IMPORTED_MODULE_2__.parseDate)(order.date)
-      if (!date) {
-        this.log('warn', `Date illisible pour une commande, ignorée`)
+      if (!date || Number.isNaN(date.getTime())) {
+        // checkRequiredAttributes fait échouer saveBills pour l'ensemble du lot
+        // dès qu'une entrée est invalide : mieux vaut écarter la commande.
+        this.log('warn', 'Date illisible pour une commande, ignorée')
         continue
       }
-      const amount = (0,_helpers__WEBPACK_IMPORTED_MODULE_2__.parseAmount)(
+      const amountValue = (0,_helpers__WEBPACK_IMPORTED_MODULE_2__.parseAmount)(
         (order.totalProductsPrice || 0) + (order.totalShippingCosts || 0)
       )
+      if (typeof amountValue !== 'number') {
+        this.log('warn', 'Montant illisible pour une commande, ignorée')
+        continue
+      }
       entries.push({
         vendorRef: String(order.orderNumber),
         date,
-        amount,
+        amount: amountValue,
         currency: 'EUR',
         vendor: 'Darty',
         filename: (0,_helpers__WEBPACK_IMPORTED_MODULE_2__.normalizeFilename)(
           `${isoDateString}_darty_${order.orderNumber}.pdf`
         ),
         fileurl: `${BILL_API}?orderId=${encodeURIComponent(order.orderNumber)}`,
-        accessToken: this.store.accessToken,
+        // Aucun secret ici : ni saveFiles ni saveBills ne nettoient les
+        // attributs inconnus, et addData persiste tout ce qui reste dans le
+        // document io.cozy.bills. Le jeton est relu dans le worker.
         fileAttributes: { metadata: { carbonCopy: true } }
       })
     }
@@ -10652,6 +10667,10 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     await this.saveBills(entries, {
       context,
       fileIdAttributes: ['vendorRef'],
+      // Sans `keys`, saveBills dédoublonne sur (date, amount, vendor). `vendor`
+      // valant toujours "Darty", deux commandes de même date et même montant
+      // seraient confondues et la première verrait son `invoice` écrasé.
+      keys: ['vendorRef'],
       contentType: 'application/pdf',
       qualificationLabel: 'appliance_invoice'
     })
@@ -10662,11 +10681,16 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   // téléchargement par défaut.
   async downloadFileInWorker(entry) {
     this.log('debug', `Téléchargement de la facture ${entry.vendorRef}`)
+    const token = await this.getAccessToken()
+    if (!token) {
+      this.log('warn', `Facture ${entry.vendorRef} : jeton indisponible`)
+      return false
+    }
     const response = await fetch(entry.fileurl, {
       headers: {
         accept: '*/*',
         'content-type': 'application/json',
-        'access-token': `Bearer ${entry.accessToken}`
+        'access-token': `Bearer ${token}`
       }
     })
     if (!response.ok) {
