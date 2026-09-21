@@ -10125,10 +10125,10 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
 /* harmony export */   normalizeFilename: () => (/* binding */ normalizeFilename),
 /* harmony export */   parseAmount: () => (/* binding */ parseAmount),
-/* harmony export */   parseFrenchDate: () => (/* binding */ parseFrenchDate)
+/* harmony export */   parseDate: () => (/* binding */ parseDate)
 /* harmony export */ });
-// Utilitaires de parsing, repris du konnector serveur (aucune dépendance Cozy :
-// ce code doit pouvoir s'exécuter dans le worker, c'est-à-dire dans la page).
+// Utilitaires de parsing purs : aucune dépendance Cozy, ce code doit pouvoir
+// s'exécuter aussi bien côté pilote que dans le worker.
 
 const forbiddenCharsRegExp = /[<>:"/\\|?*\0\s]+/g
 
@@ -10137,7 +10137,9 @@ function normalizeFilename(name) {
 }
 
 function parseAmount(amount) {
-  if (typeof amount === 'number') return amount
+  if (typeof amount === 'number') {
+    return Number.isFinite(amount) ? Math.round(amount * 100) / 100 : undefined
+  }
   if (typeof amount !== 'string') return undefined
   // Ignore tout caractère non numérique (y compris les séparateurs de milliers
   // parfois cassés) et ramène la virgule décimale à un point.
@@ -10145,13 +10147,23 @@ function parseAmount(amount) {
   return Number.isNaN(parsed) ? undefined : parsed
 }
 
-// Retourne à la fois un objet Date (pour saveBills) et une chaîne ISO
-// directement utilisable dans un nom de fichier.
-function parseFrenchDate(frDateString) {
-  const match = String(frDateString).match(/(\d{2})\/(\d{2})\/(\d{4})/)
-  if (!match) return { isoDateString: undefined, date: undefined }
-  const isoDateString = match.slice(1, 4).reverse().join('-')
-  return { isoDateString, date: new Date(isoDateString) }
+// Le format de `date` renvoyé par l'API n'est pas garanti : on accepte le
+// français JJ/MM/AAAA et tout ce que Date sait lire (ISO en particulier).
+// Retourne un objet Date pour saveBills et une chaîne ISO pour les noms de
+// fichiers, afin d'obtenir un tri chronologique naturel dans Drive.
+function parseDate(value) {
+  const empty = { isoDateString: undefined, date: undefined }
+  if (value == null) return empty
+
+  const french = String(value).match(/(\d{2})\/(\d{2})\/(\d{4})/)
+  if (french) {
+    const isoDateString = french.slice(1, 4).reverse().join('-')
+    return { isoDateString, date: new Date(isoDateString) }
+  }
+
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return empty
+  return { isoDateString: parsed.toISOString().slice(0, 10), date: parsed }
 }
 
 
@@ -10254,62 +10266,32 @@ _cozy_minilog__WEBPACK_IMPORTED_MODULE_1___default().enable()
 
 const BASE_URL = 'https://www.darty.com'
 // L'authentification est déléguée à un serveur OAuth2/OpenID (ForgeRock AM,
-// auth.darty.com, realm /alpha). On entre toujours par cette page, qui
-// redirige d'elle-même vers le fournisseur d'identité.
+// auth.darty.com, realm /alpha). On entre toujours par cette page, qui redirige
+// d'elle-même vers le fournisseur d'identité.
 const LOGIN_URL = `${BASE_URL}/authentification/login`
-// Les timeouts de cozy-clisk sont en millisecondes (ContentScript.js:34-36 —
-// DEFAULT_WAIT_FOR_ELEMENT_ACCROSS_PAGES_TIMEOUT = 60 * s).
+const LOGOUT_URL = `${BASE_URL}/espace_client/deconnexion`
+const ORDERS_PAGE_URL = `${BASE_URL}/espace_client/mes-commandes`
+
+const API = `${BASE_URL}/espace_client/api/v1`
+const ORDERS_API = `${API}/orders`
+const CUSTOMER_API = `${API}/customers-light`
+const BILL_API = `${API}/order-bill`
+
+// Les timeouts de cozy-clisk sont en millisecondes
+// (ContentScript.js : DEFAULT_WAIT_FOR_ELEMENT_ACCROSS_PAGES_TIMEOUT = 60 * s).
 const WAIT_LOGIN_FORM = 60 * 1000
 const WAIT_LOGOUT = 30 * 1000
-// Confirmée par relevé sur le site (lien présent dans le menu du compte).
-const LOGOUT_URL = `${BASE_URL}/espace_client/deconnexion`
-const ORDERS_URL = `${BASE_URL}/espace_client/mes-commandes`
-const BILL_API_URL = `${BASE_URL}/espace_client/api/v1/order-bill`
-// Autres endpoints relevés sur le site, pas encore exploités faute de connaître
-// la structure de leurs réponses : /api/v1/orders (liste), /api/v1/orders/{id}
-// (détail) et /api/v1/customers-light (probablement l'e-mail du compte).
-const API_PREFIX = `${BASE_URL}/espace_client/api/v1/`
 
-// Le formulaire de connexion se fait en deux temps : l'e-mail, puis le mot de
-// passe sur un second écran. Les classes CSS du site sont générées par Tailwind
-// et par des CSS modules (`_link_1jw3u_18`, `_OrderContainer_9a6rw_1`…) : elles
-// changent à chaque build du site et ne doivent JAMAIS servir de sélecteur.
-// On s'appuie uniquement sur les attributs stables : `name`, `type`, `href`.
+// Relevé sur le site : l'écran e-mail a un <form>, mais PAS l'écran mot de
+// passe — son champ vit dans un simple <span>. Les sélecteurs de bouton ne
+// doivent donc pas être préfixés par `form`. Les classes CSS du site sont des
+// hachages de CSS modules (`_link_1jw3u_18`) régénérés à chaque build : ne
+// jamais s'en servir. Seuls `name`, `type` et `href` sont stables.
 const SELECTORS = {
   emailField: 'input[name="mail"]',
-  // Relevé sur le site : l'écran e-mail a un <form>, mais PAS l'écran mot de
-  // passe — son champ vit dans un simple <span>. Les sélecteurs de bouton ne
-  // doivent donc pas être préfixés par `form`, sans quoi la seconde étape de
-  // l'autologin ne trouve jamais de quoi cliquer.
   emailSubmit: 'button[type="submit"]',
   passwordField: 'input[name="password"]',
-  passwordSubmit: 'button[type="submit"]',
-  orderLink: 'a[href^="/espace_client/mes-commandes/"]'
-}
-
-// L'espace client appelle son API interne avec un en-tête `access-token`
-// porteur d'un JWT (~24 h de validité). On l'intercepte au passage plutôt que
-// d'aller le chercher dans le stockage du navigateur.
-const requestInterceptor = new cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_MODULE_0__.RequestInterceptor([
-  {
-    identifier: 'dartyApi',
-    method: 'GET',
-    url: API_PREFIX,
-    exact: false,
-    serialization: 'json'
-  }
-])
-requestInterceptor.init()
-
-// Pour une requête `fetch`, RequestInterceptor ne reconstruit pas les en-têtes
-// réellement émis : il retransmet tel quel le `headers` passé en option. Selon
-// la façon dont le site construit sa requête, on reçoit donc un objet nu, une
-// instance `Headers`, ou rien du tout.
-function readHeader(headers, name) {
-  if (!headers) return undefined
-  if (typeof headers.get === 'function') return headers.get(name)
-  const key = Object.keys(headers).find(k => k.toLowerCase() === name)
-  return key ? headers[key] : undefined
+  passwordSubmit: 'button[type="submit"]'
 }
 
 class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_MODULE_0__.ContentScript {
@@ -10326,11 +10308,11 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   }
 
   // Exécuté dans le worker à chaque chargement de page. Le formulaire est un
-  // composant React en deux étapes : le `<form>` est re-rendu entre l'écran
+  // composant React en deux étapes : le <form> est re-rendu entre l'écran
   // e-mail et l'écran mot de passe, et la soumission ne produit pas forcément
-  // d'événement `submit` natif. On n'accroche donc rien sur le formulaire :
-  // on écoute le document en phase de capture, et on relève la valeur des
-  // champs à chaque fois que l'utilisateur quitte un champ ou valide.
+  // d'événement `submit` natif. On n'accroche donc rien sur le formulaire : on
+  // écoute le document en phase de capture et on relève la valeur des champs
+  // chaque fois que l'utilisateur quitte un champ ou valide.
   onWorkerReady() {
     const collect = () => {
       const login = document.querySelector(SELECTORS.emailField)?.value
@@ -10362,35 +10344,25 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   }
 
   onWorkerEvent({ event, payload }) {
-    if (event === 'loginSubmit') {
-      // Le formulaire étant en deux étapes, chaque soumission n'apporte qu'une
-      // partie des identifiants : on fusionne au lieu d'écraser.
-      const previous = this.store.userCredentials || {}
-      const merged = {
-        login: payload?.login || previous.login,
-        password: payload?.password || previous.password
-      }
-      const changed =
-        merged.login !== previous.login || merged.password !== previous.password
-      this.store.userCredentials = merged
-      if (changed) {
-        // On ne journalise que la présence des champs, jamais leur valeur.
-        this.log(
-          'info',
-          `Identifiants capturés : login=${Boolean(
-            merged.login
-          )} password=${Boolean(merged.password)}`
-        )
-      }
-    } else if (
-      event === 'requestResponse' &&
-      payload?.identifier === 'dartyApi'
-    ) {
-      const token = readHeader(payload.requestHeaders, 'access-token')
-      if (token) {
-        this.log('info', "Jeton d'accès à l'API capturé")
-        this.store.accessToken = token
-      }
+    if (event !== 'loginSubmit') return
+    // Le formulaire étant en deux étapes, chaque soumission n'apporte qu'une
+    // partie des identifiants : on fusionne au lieu d'écraser.
+    const previous = this.store.userCredentials || {}
+    const merged = {
+      login: payload?.login || previous.login,
+      password: payload?.password || previous.password
+    }
+    const changed =
+      merged.login !== previous.login || merged.password !== previous.password
+    this.store.userCredentials = merged
+    if (changed) {
+      // On ne journalise que la présence des champs, jamais leur valeur.
+      this.log(
+        'info',
+        `Identifiants capturés : login=${Boolean(
+          merged.login
+        )} password=${Boolean(merged.password)}`
+      )
     }
   }
 
@@ -10401,30 +10373,14 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
       await this.ensureNotAuthenticated()
     }
 
-    const credentials = await this.getCredentials()
-    const hasCredentials = Boolean(credentials?.login && credentials?.password)
-
-    await this.goto(ORDERS_URL)
-    const authenticated = await this.runInWorker('checkAuthenticated')
-
-    if (authenticated && hasCredentials) {
+    await this.goto(ORDERS_PAGE_URL)
+    if (await this.runInWorker('checkAuthenticated')) {
       this.log('info', 'Session déjà active')
       return true
     }
 
-    if (authenticated && !hasCredentials) {
-      // Sans identifiants, getUserDataFromWebsite ne peut pas construire de
-      // sourceAccountIdentifier, et le konnector échouerait à chaque run sans
-      // jamais afficher de formulaire. On force donc une reconnexion, seule
-      // occasion de capturer le login.
-      this.log(
-        'warn',
-        'Session active mais aucun identifiant mémorisé : reconnexion forcée'
-      )
-      await this.ensureNotAuthenticated()
-    }
-
-    if (hasCredentials) {
+    const credentials = await this.getCredentials()
+    if (credentials?.login && credentials?.password) {
       try {
         await this.authWithCredentials(credentials)
         await this.persistCapturedCredentials()
@@ -10439,19 +10395,14 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     return true
   }
 
-  // Le launcher appelle ensureAuthenticated, puis getUserDataFromWebsite, puis
-  // fetch. C'est la convention des konnectors Cozy, mais l'ordonnanceur vit
-  // dans l'application native et non dans cozy-clisk : ce n'est pas vérifiable
-  // depuis ce dépôt. On écrit donc le trousseau au plus tôt, dès la fin de
-  // l'authentification, plutôt que d'attendre fetch().
   async persistCapturedCredentials() {
     const { login, password } = this.store.userCredentials || {}
     if (!login || !password) {
       this.log(
-        'warn',
-        `Identifiants incomplets : login=${Boolean(login)} password=${Boolean(
-          password
-        )}`
+        'info',
+        `Pas d'identifiants complets à mémoriser : login=${Boolean(
+          login
+        )} password=${Boolean(password)}`
       )
       return
     }
@@ -10470,7 +10421,9 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     await this.navigateToLoginForm()
     await this.runInWorker('fillText', SELECTORS.emailField, login)
     await this.runInWorker('click', SELECTORS.emailSubmit)
-    await this.waitForElementInWorker(SELECTORS.passwordField)
+    await this.waitForElementInWorker(SELECTORS.passwordField, {
+      timeout: WAIT_LOGIN_FORM
+    })
     await this.runInWorker('fillText', SELECTORS.passwordField, password)
     await this.runInWorker('click', SELECTORS.passwordSubmit)
     await this.runInWorkerUntilTrue({ method: 'waitForAuthenticated' })
@@ -10491,23 +10444,27 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     this.log('info', '🤖 ensureNotAuthenticated')
     await this.goto(LOGOUT_URL)
     await this.goto(LOGIN_URL)
-    // Garde-fou : si la déconnexion n'a pas pris effet, attendre le champ
-    // e-mail bloquerait jusqu'au timeout. On le détecte et on le dit.
-    if (await this.runInWorker('checkAuthenticated')) {
+    // `goto` ne fait que déclencher la navigation, il ne l'attend pas : tester
+    // checkAuthenticated() juste après l'évaluerait sur la page précédente. On
+    // attend donc l'apparition du champ e-mail, seul signe fiable que la
+    // session est bien tombée.
+    try {
+      await this.waitForElementInWorker(SELECTORS.emailField, {
+        timeout: WAIT_LOGOUT
+      })
+      return true
+    } catch (err) {
       this.log(
         'warn',
-        `Déconnexion sans effet : ${LOGOUT_URL} n'est probablement pas la bonne URL`
+        `Déconnexion sans effet : le formulaire de connexion n'est pas apparu ` +
+          `dans les ${WAIT_LOGOUT / 1000}s suivant ${LOGOUT_URL}`
       )
       return false
     }
-    await this.waitForElementInWorker(SELECTORS.emailField, {
-      timeout: WAIT_LOGOUT
-    })
-    return true
   }
 
   // Exécuté dans le worker. Un visiteur non authentifié qui demande l'espace
-  // client est renvoyé vers /authentification/login par le serveur d'identité :
+  // client est renvoyé vers /authentification/ par le serveur d'identité :
   // rester sur /espace_client/ est donc le signal fiable.
   async checkAuthenticated() {
     if (document.location.pathname.startsWith('/authentification/'))
@@ -10517,70 +10474,155 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   }
 
   // -------------------------------------------------------------------------
+  // Accès à l'API interne de l'espace client
+  // -------------------------------------------------------------------------
+
+  // Exécuté dans le worker. L'espace client range son jeton d'API dans
+  // localStorage.currentUser : un JWT HS512 de charge utile {jti,iat,iss,exp},
+  // valable ~24 h. À ne pas confondre avec les jetons RS256 du SDK ForgeRock
+  // stockés à côté, que l'API refuse (401/503).
+  async getAccessToken() {
+    let raw = null
+    try {
+      raw = window.localStorage.getItem('currentUser')
+    } catch (err) {
+      return null
+    }
+    if (!raw) return null
+    const tokens = raw.match(
+      /ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g
+    )
+    if (!tokens) return null
+    for (const token of tokens) {
+      try {
+        const header = JSON.parse(
+          window.atob(token.split('.')[0].replace(/-/g, '+').replace(/_/g, '/'))
+        )
+        if (header.alg === 'HS512') return token
+      } catch (err) {
+        // Jeton illisible : on passe au suivant.
+      }
+    }
+    return tokens[0]
+  }
+
+  // Exécuté dans le worker : la requête part de la page, donc avec ses cookies
+  // et sur la bonne origine.
+  async fetchApi(url, token) {
+    const response = await fetch(url, {
+      headers: {
+        accept: '*/*',
+        'content-type': 'application/json',
+        'access-token': `Bearer ${token}`
+      }
+    })
+    if (!response.ok) {
+      return { error: `HTTP ${response.status}` }
+    }
+    try {
+      return { data: await response.json() }
+    } catch (err) {
+      return { error: 'réponse non JSON' }
+    }
+  }
+
+  async callApi(url) {
+    if (!this.store.accessToken) {
+      this.store.accessToken = await this.runInWorker('getAccessToken')
+      if (!this.store.accessToken) {
+        throw new Error(
+          "Aucun jeton d'API dans localStorage.currentUser : la session n'est " +
+            'probablement pas établie.'
+        )
+      }
+    }
+    const { data, error } = await this.runInWorker(
+      'fetchApi',
+      url,
+      this.store.accessToken
+    )
+    if (error) throw new Error(`${url.replace(BASE_URL, '')} : ${error}`)
+    return data
+  }
+
+  // -------------------------------------------------------------------------
   // Collecte
   // -------------------------------------------------------------------------
 
-  // Doit être instantané : on retourne le login mémorisé, sans re-scraper.
   async getUserDataFromWebsite() {
     this.log('info', '🤖 getUserDataFromWebsite')
+    const customer = await this.callApi(CUSTOMER_API)
+    const email = customer?.customerLightBean?.email
+    if (email) return { sourceAccountIdentifier: email }
+
+    // Repli sur les identifiants saisis, si l'API venait à changer de forme.
     const login =
       this.store.userCredentials?.login || (await this.getCredentials())?.login
-    if (!login) {
-      throw new Error(
-        'Aucun identifiant disponible pour construire le sourceAccountIdentifier : ' +
-          "ni la capture dans le formulaire ni le trousseau n'ont fourni de login. " +
-          "Si la webview était déjà authentifiée, aucun formulaire ne s'est affiché."
-      )
+    if (login) {
+      this.log('warn', "E-mail absent de l'API, repli sur le login saisi")
+      return { sourceAccountIdentifier: login }
     }
-    return { sourceAccountIdentifier: login }
+    throw new Error(
+      'Impossible de déterminer le sourceAccountIdentifier : ni ' +
+        `${CUSTOMER_API.replace(BASE_URL, '')} ni le trousseau n'ont fourni ` +
+        "d'adresse e-mail."
+    )
   }
 
   async fetch(context) {
     this.log('info', '🤖 fetch')
     await this.persistCapturedCredentials()
 
-    await this.goto(ORDERS_URL)
-    await this.waitForElementInWorker(SELECTORS.orderLink)
+    const payload = await this.callApi(ORDERS_API)
+    const orders = payload?.orders || []
+    this.log('info', `${orders.length} commande(s) retournée(s) par l'API`)
 
-    const rawOrders = await this.runInWorker('parseOrders')
-    this.log('info', `${rawOrders.length} commande(s) trouvée(s)`)
-    if (!rawOrders.length) return
-
-    // Le parsing des dates se fait côté pilote : les objets Date ne survivent
-    // pas au pont post-me entre le worker et le pilote, ils y deviennent des
-    // chaînes.
-    const orders = rawOrders.map(order => ({
-      ...order,
-      ...(0,_helpers__WEBPACK_IMPORTED_MODULE_2__.parseFrenchDate)(order.rawDate)
-    }))
-
-    if (!this.store.accessToken) {
-      throw new Error(
-        "Aucun jeton d'accès intercepté : l'espace client n'a émis aucun appel " +
-          "vers l'API interne pendant la navigation."
+    const withBill = orders.filter(order => order.billAvailable)
+    const skipped = orders.length - withBill.length
+    if (skipped) {
+      this.log(
+        'info',
+        `${skipped} commande(s) sans facture disponible, ignorée(s)`
       )
     }
+    if (!withBill.length) return
 
-    const entries = orders.map(order => ({
-      // `vendorRef` sert de clé de dédoublonnage via fileIdAttributes.
-      // `vendor`/`amount` ne sont pas posés ici : saveFiles ne les lit pas, ils
-      // n'ont de sens qu'avec saveBills — voir le TODO plus bas.
-      vendorRef: order.orderId,
-      date: order.date,
-      filename: (0,_helpers__WEBPACK_IMPORTED_MODULE_2__.normalizeFilename)(
-        `${order.isoDateString || order.orderId}-${order.label}.pdf`
-      ),
-      fileurl: `${BILL_API_URL}?orderId=${order.orderId}`,
-      accessToken: this.store.accessToken,
-      fileAttributes: { metadata: { carbonCopy: true } }
-    }))
+    // Journalisé une seule fois, chiffres masqués, pour pouvoir diagnostiquer
+    // un changement de format de date sans exposer de donnée.
+    this.log(
+      'info',
+      `Format de date observé : ${String(withBill[0].date).replace(/\d/g, '#')}`
+    )
 
-    // TODO : passer à saveBills() dès qu'on saura récupérer le montant de
-    // chaque commande. saveFiles n'écrit que des io.cozy.files ; seul saveBills
-    // crée des io.cozy.bills, et il exige date + amount + vendor
-    // (saveBills.js:19-24). Sans montant, pas de rattachement aux opérations
-    // bancaires.
-    await this.saveFiles(entries, {
+    const entries = []
+    for (const order of withBill) {
+      const { date, isoDateString } = (0,_helpers__WEBPACK_IMPORTED_MODULE_2__.parseDate)(order.date)
+      if (!date) {
+        this.log('warn', `Date illisible pour une commande, ignorée`)
+        continue
+      }
+      const amount = (0,_helpers__WEBPACK_IMPORTED_MODULE_2__.parseAmount)(
+        (order.totalProductsPrice || 0) + (order.totalShippingCosts || 0)
+      )
+      entries.push({
+        vendorRef: String(order.orderNumber),
+        date,
+        amount,
+        currency: 'EUR',
+        vendor: 'Darty',
+        filename: (0,_helpers__WEBPACK_IMPORTED_MODULE_2__.normalizeFilename)(
+          `${isoDateString}_darty_${order.orderNumber}.pdf`
+        ),
+        fileurl: `${BILL_API}?orderId=${encodeURIComponent(order.orderNumber)}`,
+        accessToken: this.store.accessToken,
+        fileAttributes: { metadata: { carbonCopy: true } }
+      })
+    }
+
+    this.log('info', `${entries.length} facture(s) à enregistrer`)
+    if (!entries.length) return
+
+    await this.saveBills(entries, {
       context,
       fileIdAttributes: ['vendorRef'],
       contentType: 'application/pdf',
@@ -10589,7 +10631,7 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   }
 
   // Exécuté dans le worker. L'API des factures ne renvoie pas un PDF binaire
-  // mais du JSON `{ bill: "<base64>" }` — il faut donc remplacer le
+  // mais du JSON `{ bill: "<base64>" }` : il faut donc remplacer le
   // téléchargement par défaut.
   async downloadFileInWorker(entry) {
     this.log('debug', `Téléchargement de la facture ${entry.vendorRef}`)
@@ -10597,53 +10639,33 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
       headers: {
         accept: '*/*',
         'content-type': 'application/json',
-        'access-token': entry.accessToken
+        'access-token': `Bearer ${entry.accessToken}`
       }
     })
     if (!response.ok) {
       this.log('warn', `Facture ${entry.vendorRef} : HTTP ${response.status}`)
       return false
     }
-    const payload = await response.json()
+    let payload
+    try {
+      payload = await response.json()
+    } catch (err) {
+      this.log('warn', `Facture ${entry.vendorRef} : réponse non JSON`)
+      return false
+    }
     if (!payload?.bill) {
-      this.log('warn', `Facture ${entry.vendorRef} : réponse sans champ "bill"`)
+      this.log('warn', `Facture ${entry.vendorRef} : champ "bill" absent`)
       return false
     }
     entry.dataUri = `data:application/pdf;base64,${payload.bill}`
     return entry.dataUri
   }
-
-  // Exécuté dans le worker.
-  async parseOrders() {
-    const links = Array.from(
-      document.querySelectorAll('a[href^="/espace_client/mes-commandes/"]')
-    )
-    const byOrderId = new Map()
-    for (const link of links) {
-      // /espace_client/mes-commandes/<orderId>/<index>
-      const orderId = link.getAttribute('href').split('/')[3]
-      if (!orderId || byOrderId.has(orderId)) continue
-      const text = (link.textContent || '').trim()
-      // Le libellé du lien porte la date puis le nom du produit, par exemple
-      // « Expédiée le 01/02/2026Passerelle multimédia ».
-      const dateMatch = text.match(/(\d{2}\/\d{2}\/\d{4})/)
-      const label = dateMatch
-        ? text.slice(text.indexOf(dateMatch[1]) + dateMatch[1].length).trim()
-        : text
-      byOrderId.set(orderId, {
-        orderId,
-        rawDate: dateMatch ? dateMatch[1] : null,
-        label: label || orderId
-      })
-    }
-    return Array.from(byOrderId.values())
-  }
 }
 
-const connector = new DartyContentScript({ requestInterceptor })
+const connector = new DartyContentScript()
 connector
   .init({
-    additionalExposedMethodsNames: ['parseOrders']
+    additionalExposedMethodsNames: ['getAccessToken', 'fetchApi']
   })
   .catch(err => {
     log.warn(err)
