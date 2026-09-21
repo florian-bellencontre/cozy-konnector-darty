@@ -10291,6 +10291,7 @@ const BILL_API = `${API}/order-bill`
 const WAIT_LOGIN_FORM = 60 * 1000
 const WAIT_LOGOUT = 10 * 1000
 const WAIT_TOKEN = 60 * 1000
+const WAIT_PAGE = 60 * 1000
 
 // Relevé sur le site : l'écran e-mail a un <form>, mais PAS l'écran mot de
 // passe — son champ vit dans un simple <span>. Les sélecteurs de bouton ne
@@ -10395,10 +10396,27 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     }
 
     await this.goto(ORDERS_PAGE_URL)
+    // `goto` se contente d'un setWorkerState({url}) et rend la main aussitôt :
+    // interroger checkAuthenticated dans la foulée l'évaluerait sur la page
+    // précédente. On attend donc d'avoir atterri quelque part d'identifiable —
+    // soit l'espace client, soit le formulaire de connexion.
+    try {
+      await this.runInWorkerUntilTrue({
+        method: 'waitForLoginFormOrSession',
+        timeout: WAIT_PAGE
+      })
+    } catch (err) {
+      throw new Error(
+        `Ni l'espace client ni le formulaire de connexion n'est apparu dans ` +
+          `les ${WAIT_PAGE / 1000}s suivant ${ORDERS_PAGE_URL}`
+      )
+    }
+
     if (await this.runInWorker('checkAuthenticated')) {
       this.log('info', 'Session déjà active')
       return true
     }
+    this.log('info', 'Aucune session active, authentification nécessaire')
 
     const credentials = await this.getCredentials()
     if (credentials?.login && credentials?.password) {
@@ -10516,6 +10534,13 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
       )
       return false
     }
+  }
+
+  // Exécuté dans le worker, en boucle : vrai dès que la navigation a abouti à
+  // un état identifiable, quel qu'il soit.
+  async waitForLoginFormOrSession() {
+    if (document.querySelector('input[name="mail"]')) return true
+    return document.location.pathname.startsWith('/espace_client/')
   }
 
   // Exécuté dans le worker. Un visiteur non authentifié qui demande l'espace
@@ -10763,6 +10788,7 @@ connector
     additionalExposedMethodsNames: [
       'getAccessToken',
       'waitForAccessToken',
+      'waitForLoginFormOrSession',
       'fetchApi'
     ]
   })
