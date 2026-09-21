@@ -10566,31 +10566,55 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   // Exécuté dans le worker : la requête part de la page, donc avec ses cookies
   // et sur la bonne origine.
   async fetchApi(url, token) {
-    const response = await fetch(url, {
-      headers: {
-        accept: '*/*',
-        'content-type': 'application/json',
-        'access-token': `Bearer ${token}`
-      }
-    })
+    let response
+    try {
+      response = await fetch(url, {
+        headers: {
+          accept: '*/*',
+          'content-type': 'application/json',
+          'access-token': `Bearer ${token}`
+        }
+      })
+    } catch (err) {
+      return { error: `échec réseau : ${err.message}` }
+    }
     if (!response.ok) {
-      return { error: `HTTP ${response.status}` }
+      return { status: response.status, error: `HTTP ${response.status}` }
     }
     try {
-      return { data: await response.json() }
+      return { status: response.status, data: await response.json() }
     } catch (err) {
-      return { error: 'réponse non JSON' }
+      return { status: response.status, error: 'réponse non JSON' }
     }
   }
 
   async callApi(url) {
     await this.ensureAccessToken()
-    const { data, error } = await this.runInWorker(
+    const result = await this.runInWorker(
       'fetchApi',
       url,
       this.store.accessToken
     )
-    if (error) throw new Error(`${url.replace(BASE_URL, '')} : ${error}`)
+    const path = url.replace(BASE_URL, '')
+    // Un worker redémarré ou indisponible fait renvoyer `undefined` à
+    // runInWorker. Sans ce garde-fou, l'absence de réponse serait prise pour
+    // une réponse vide : zéro commande, et un échec silencieux.
+    if (!result || typeof result !== 'object') {
+      throw new Error(
+        `${path} : le worker n'a rien renvoyé (${typeof result}) — appel non exécuté`
+      )
+    }
+    const { data, error, status } = result
+    if (error) throw new Error(`${path} : ${error}`)
+    if (!data || typeof data !== 'object') {
+      throw new Error(`${path} : HTTP ${status} mais charge utile vide`)
+    }
+    // Les noms de champs de premier niveau, jamais les valeurs : de quoi voir
+    // immédiatement si l'API a répondu autre chose que ce qu'on attend.
+    this.log(
+      'info',
+      `${path} : HTTP ${status}, clés = [${Object.keys(data || {}).join(', ')}]`
+    )
     return data
   }
 
