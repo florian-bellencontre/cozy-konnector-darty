@@ -10274,6 +10274,13 @@ const LOGIN_URL = `${BASE_URL}/authentification/login`
 const LOGOUT_URL = `${BASE_URL}/espace_client/deconnexion`
 const ORDERS_PAGE_URL = `${BASE_URL}/espace_client/mes-commandes`
 
+// Doit rester aligné sur `banksTransactionRegExp` du manifest : contrairement à
+// cozy-konnector-libs, le saveBills de cozy-clisk ne recopie PAS ce champ du
+// manifest dans matchingCriterias. Sans lui, Banks retombe sur son dictionnaire
+// de marques, et `defaultShouldUpdate` réécrit la facture à chaque run puisque
+// matchingCriterias reste vide.
+const BANK_LABEL_REGEX = '\\bdarty\\b'
+
 const API = `${BASE_URL}/espace_client/api/v1`
 const ORDERS_API = `${API}/orders`
 const CUSTOMER_API = `${API}/customers-light`
@@ -10372,8 +10379,19 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   async ensureAuthenticated({ account }) {
     this.log('info', '🤖 ensureAuthenticated')
 
+    // Le template CliSK déconnecte à la création d'un compte, pour ne pas
+    // adopter la session d'un autre utilisateur. Chez Darty la déconnexion est
+    // sans effet (constaté : /espace_client/deconnexion ne ferme pas la
+    // session), donc on paierait l'attente sans obtenir la garantie. On
+    // réutilise la session en place ; `sourceAccountIdentifier` venant de
+    // /customers-light, le compte reste étiqueté avec la bonne adresse.
+    // Contrepartie : pour connecter un autre compte Darty, il faut se
+    // déconnecter soi-même dans la webview.
     if (!account) {
-      await this.ensureNotAuthenticated()
+      this.log(
+        'info',
+        'Création de compte : la session en place est réutilisée'
+      )
     }
 
     await this.goto(ORDERS_PAGE_URL)
@@ -10654,6 +10672,8 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
           `${isoDateString}_darty_${order.orderNumber}.pdf`
         ),
         fileurl: `${BILL_API}?orderId=${encodeURIComponent(order.orderNumber)}`,
+        // Permet à Banks d'apparier la facture à l'opération bancaire.
+        matchingCriterias: { labelRegex: BANK_LABEL_REGEX },
         // Aucun secret ici : ni saveFiles ni saveBills ne nettoient les
         // attributs inconnus, et addData persiste tout ce qui reste dans le
         // document io.cozy.bills. Le jeton est relu dans le worker.
