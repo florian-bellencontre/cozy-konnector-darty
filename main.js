@@ -10257,6 +10257,8 @@ const BASE_URL = 'https://www.darty.com'
 // auth.darty.com, realm /alpha). On entre toujours par cette page, qui
 // redirige d'elle-même vers le fournisseur d'identité.
 const LOGIN_URL = `${BASE_URL}/authentification/login`
+// Hypothèse non vérifiée sur le site : voir ensureNotAuthenticated().
+const LOGOUT_URL = `${BASE_URL}/espace_client/deconnexion`
 const ORDERS_URL = `${BASE_URL}/espace_client/mes-commandes`
 const BILL_API_URL = `${BASE_URL}/espace_client/api/v1/order-bill`
 const API_PREFIX = `${BASE_URL}/espace_client/api/v1/`
@@ -10308,30 +10310,43 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
   async navigateToLoginForm() {
     this.log('info', '🤖 navigateToLoginForm')
     await this.goto(LOGIN_URL)
-    await this.waitForElementInWorker(SELECTORS.emailField)
+    await this.waitForElementInWorker(SELECTORS.emailField, { timeout: 60 })
   }
 
+  // Exécuté dans le worker à chaque chargement de page. Le formulaire est un
+  // composant React en deux étapes : le `<form>` est re-rendu entre l'écran
+  // e-mail et l'écran mot de passe, et la soumission ne produit pas forcément
+  // d'événement `submit` natif. On n'accroche donc rien sur le formulaire :
+  // on écoute le document en phase de capture, et on relève la valeur des
+  // champs à chaque fois que l'utilisateur quitte un champ ou valide.
   onWorkerReady() {
-    const attach = () => {
-      const emailField = document.querySelector(SELECTORS.emailField)
-      const passwordField = document.querySelector(SELECTORS.passwordField)
-      const form = (emailField || passwordField)?.closest('form')
-      if (!form) return
-      form.addEventListener('submit', () => {
-        this.bridge.emit('workerEvent', {
-          event: 'loginSubmit',
-          payload: {
-            login: emailField?.value,
-            password: passwordField?.value
-          }
-        })
+    const collect = () => {
+      const login = document.querySelector(SELECTORS.emailField)?.value
+      const password = document.querySelector(SELECTORS.passwordField)?.value
+      if (!login && !password) return
+      this.bridge.emit('workerEvent', {
+        event: 'loginSubmit',
+        payload: { login, password }
       })
     }
-    if (document.readyState === 'loading') {
-      window.addEventListener('DOMContentLoaded', attach)
-    } else {
-      attach()
-    }
+
+    document.addEventListener('blur', collect, true)
+    document.addEventListener('change', collect, true)
+    document.addEventListener('submit', collect, true)
+    document.addEventListener(
+      'keydown',
+      event => {
+        if (event.key === 'Enter') collect()
+      },
+      true
+    )
+    document.addEventListener(
+      'click',
+      event => {
+        if (event.target?.closest?.('button')) collect()
+      },
+      true
+    )
   }
 
   onWorkerEvent({ event, payload }) {
@@ -10339,9 +10354,21 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
       // Le formulaire étant en deux étapes, chaque soumission n'apporte qu'une
       // partie des identifiants : on fusionne au lieu d'écraser.
       const previous = this.store.userCredentials || {}
-      this.store.userCredentials = {
+      const merged = {
         login: payload?.login || previous.login,
         password: payload?.password || previous.password
+      }
+      const changed =
+        merged.login !== previous.login || merged.password !== previous.password
+      this.store.userCredentials = merged
+      if (changed) {
+        // On ne journalise que la présence des champs, jamais leur valeur.
+        this.log(
+          'info',
+          `Identifiants capturés : login=${Boolean(
+            merged.login
+          )} password=${Boolean(merged.password)}`
+        )
       }
     } else if (
       event === 'requestResponse' &&
@@ -10357,24 +10384,38 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
 
   async ensureAuthenticated({ account }) {
     this.log('info', '🤖 ensureAuthenticated')
-    // Pas d'abonnement manuel à `workerEvent` ici : la lib le fait déjà pour le
-    // pilote dans setContentScriptType(). S'y réabonner empilerait un listener
-    // supplémentaire à chaque appel.
 
     if (!account) {
       await this.ensureNotAuthenticated()
     }
 
+    const credentials = await this.getCredentials()
+    const hasCredentials = Boolean(credentials?.login && credentials?.password)
+
     await this.goto(ORDERS_URL)
-    if (await this.runInWorker('checkAuthenticated')) {
+    const authenticated = await this.runInWorker('checkAuthenticated')
+
+    if (authenticated && hasCredentials) {
       this.log('info', 'Session déjà active')
       return true
     }
 
-    const credentials = await this.getCredentials()
-    if (credentials?.login && credentials?.password) {
+    if (authenticated && !hasCredentials) {
+      // Sans identifiants, getUserDataFromWebsite ne peut pas construire de
+      // sourceAccountIdentifier, et le konnector échouerait à chaque run sans
+      // jamais afficher de formulaire. On force donc une reconnexion, seule
+      // occasion de capturer le login.
+      this.log(
+        'warn',
+        'Session active mais aucun identifiant mémorisé : reconnexion forcée'
+      )
+      await this.ensureNotAuthenticated()
+    }
+
+    if (hasCredentials) {
       try {
         await this.authWithCredentials(credentials)
+        await this.persistCapturedCredentials()
         return true
       } catch (err) {
         this.log('warn', `Autologin échoué (${err.message}), passage en manuel`)
@@ -10382,7 +10423,34 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
     }
 
     await this.showLoginFormAndWaitForAuthentication()
+    await this.persistCapturedCredentials()
     return true
+  }
+
+  // Le launcher appelle ensureAuthenticated, puis getUserDataFromWebsite, puis
+  // fetch. C'est la convention des konnectors Cozy, mais l'ordonnanceur vit
+  // dans l'application native et non dans cozy-clisk : ce n'est pas vérifiable
+  // depuis ce dépôt. On écrit donc le trousseau au plus tôt, dès la fin de
+  // l'authentification, plutôt que d'attendre fetch().
+  async persistCapturedCredentials() {
+    const { login, password } = this.store.userCredentials || {}
+    if (!login || !password) {
+      this.log(
+        'warn',
+        `Identifiants incomplets : login=${Boolean(login)} password=${Boolean(
+          password
+        )}`
+      )
+      return
+    }
+    try {
+      await this.saveCredentials({ login, password })
+      this.log('info', 'Identifiants enregistrés dans le trousseau')
+    } catch (err) {
+      // Une authentification réussie ne doit pas être perdue parce que
+      // l'écriture du trousseau a échoué.
+      this.log('warn', `Écriture du trousseau impossible : ${err.message}`)
+    }
   }
 
   async authWithCredentials({ login, password }) {
@@ -10409,8 +10477,19 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
 
   async ensureNotAuthenticated() {
     this.log('info', '🤖 ensureNotAuthenticated')
-    await this.goto(`${BASE_URL}/espace_client/deconnexion`)
-    await this.navigateToLoginForm()
+    await this.goto(LOGOUT_URL)
+    await this.goto(LOGIN_URL)
+    // LOGOUT_URL est une hypothèse non confirmée sur le site. Si elle est
+    // fausse, la session survit et attendre le champ e-mail bloquerait jusqu'au
+    // timeout : on le détecte et on le dit clairement dans les logs.
+    if (await this.runInWorker('checkAuthenticated')) {
+      this.log(
+        'warn',
+        `Déconnexion sans effet : ${LOGOUT_URL} n'est probablement pas la bonne URL`
+      )
+      return false
+    }
+    await this.waitForElementInWorker(SELECTORS.emailField, { timeout: 30 })
     return true
   }
 
@@ -10435,7 +10514,9 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
       this.store.userCredentials?.login || (await this.getCredentials())?.login
     if (!login) {
       throw new Error(
-        'Aucun identifiant disponible pour construire le sourceAccountIdentifier'
+        'Aucun identifiant disponible pour construire le sourceAccountIdentifier : ' +
+          "ni la capture dans le formulaire ni le trousseau n'ont fourni de login. " +
+          "Si la webview était déjà authentifiée, aucun formulaire ne s'est affiché."
       )
     }
     return { sourceAccountIdentifier: login }
@@ -10443,9 +10524,7 @@ class DartyContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED
 
   async fetch(context) {
     this.log('info', '🤖 fetch')
-    if (this.store.userCredentials) {
-      await this.saveCredentials(this.store.userCredentials)
-    }
+    await this.persistCapturedCredentials()
 
     await this.goto(ORDERS_URL)
     await this.waitForElementInWorker(SELECTORS.orderLink)
